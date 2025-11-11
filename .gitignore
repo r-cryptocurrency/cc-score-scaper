@@ -1,0 +1,36 @@
+# Python cache and build files
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.log
+
+# Virtual environment folders
+.venv/
+env/
+venv/
+
+# SQLite database (local data storage)
+moon_data.db
+
+# CSV exports and temporary files
+*.csv
+*.tmp
+
+# Streamlit cache and config
+.streamlit/
+.streamlit/secrets.toml
+
+# Jupyter or IPython files
+.ipynb_checkpoints/
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# IDE and editor files
+.vscode/
+.idea/
+
+# Environment variables
+.env
