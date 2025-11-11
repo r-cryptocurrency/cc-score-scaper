@@ -1,0 +1,6 @@
+praw==7.8.1
+pandas==2.3.4
+streamlit==1.40.1
+requests>=2.32.0
+python-dateutil>=2.8.2
+tzdata>=2025.2
