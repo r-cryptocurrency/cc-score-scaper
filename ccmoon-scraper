@@ -1,0 +1,407 @@
+import praw
+import pandas as pd
+from datetime import datetime, timedelta, timezone
+import sqlite3
+from pathlib import Path
+
+# ==========================
+# CONFIG – FILL THESE IN
+# ==========================
+
+# Create a Reddit app at https://www.reddit.com/prefs/apps
+# and paste your credentials here.
+CLIENT_ID = "YOUR_CLIENT_ID_HERE"
+CLIENT_SECRET = "YOUR_CLIENT_SECRET_HERE"
+USER_AGENT = "ccmoon snapshot script by /u/YOUR_USERNAME_HERE"
+
+SUBREDDIT_NAME = "CryptoCurrency"
+MAX_POSTS = None  # None = Reddit default (up to ~1000). Or set an int like 500.
+
+# --- TIME RANGE SETTINGS ---
+
+# If True, use fixed calendar dates (good for Moon Weeks)
+# If False, use DAYS_BACK (good for "run this daily")
+USE_FIXED_DATES = True
+
+# When USE_FIXED_DATES is True, use these:
+# Dates are in YYYY-MM-DD, UTC. START is inclusive, END is inclusive.
+START_DATE_STR = "2025-11-01"   # <-- change to your Moon Week start
+END_DATE_STR   = "2025-11-11"   # <-- change to your Moon Week end
+
+# When USE_FIXED_DATES is False, this is used instead:
+DAYS_BACK = 1   # e.g. 1 for "last day", 7 for "last week", 28 for "last 28 days"
+
+DB_PATH = Path("moon_data.db")
+
+# ==========================
+# HELPER FUNCTIONS
+# ==========================
+
+# --- Moon Week mapping ---
+# Adjust these as you define more Moon Weeks
+MOON_WEEKS = [
+    ("68", "2025-10-01", "2025-10-29"),
+    ("69", "2025-10-30", "2025-11-26"),
+    # Add more Moon Weeks here as needed
+]
+
+
+def get_moon_week(date_str):
+    """
+    date_str is 'YYYY-MM-DD'.
+    Return the Moon Week ID (as a string) or None if it doesn't fall in a defined week.
+    """
+    for week_id, start, end in MOON_WEEKS:
+        if start <= date_str <= end:
+            return week_id
+    return None
+
+
+def classify_post_content_type(submission):
+    """Return 'text', 'image', 'link', or 'other' for a submission."""
+    if submission.is_self:
+        return "text"
+
+    hint = getattr(submission, "post_hint", "") or ""
+    url = (submission.url or "").lower()
+
+    image_exts = (".jpg", ".jpeg", ".png", ".gif", ".gifv", ".webp")
+    if hint == "image" or url.endswith(image_exts):
+        return "image"
+
+    if url.startswith("http"):
+        return "link"
+
+    return "other"
+
+
+def is_rewards_exempt(author_name):
+    """
+    Rewards Exempt is True if:
+      - author is [deleted]
+      - author is coinfeeds-bot (case-insensitive)
+    """
+    if not author_name:
+        return True
+    name = author_name.strip()
+    if name == "[deleted]":
+        return True
+    if name.lower() == "coinfeeds-bot":
+        return True
+    return False
+
+
+def compute_adjusted_score(score, flair, rewards_exempt):
+    """
+    Apply adjustments:
+      - If rewards_exempt → 0
+      - Else if flair == MEME (case-insensitive) → 25% weight (0.25x)
+      - Else → full score
+    """
+    if rewards_exempt:
+        return 0
+
+    flair_text = (flair or "").strip().upper()
+    if flair_text == "MEME":
+        return int(round(score * 0.25))
+
+    return int(score)
+
+
+def save_snapshot_to_db(df, db_path=DB_PATH):
+    """
+    Save or update snapshot rows into a local SQLite database.
+    - Each Reddit item (post or comment) is identified by 'id' (PRIMARY KEY).
+    - If we see the same id again, we update its score + adjusted_score + dates.
+    This way:
+      - Scores change day over day while Reddit still returns the item.
+      - Once Reddit stops returning it (due to listing limits), the last stored
+        score stays in the DB as the final value.
+    """
+    # Make a copy with DB-friendly column names
+    db_df = df.copy()
+    db_df = db_df.rename(columns={
+        "Adjusted Score": "adjusted_score",
+        "Rewards Exempt": "rewards_exempt",
+    })
+
+    # Connect (creates the file if it doesn't exist)
+    conn = sqlite3.connect(str(db_path))
+    cur = conn.cursor()
+
+    # Create table if it doesn't exist yet
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS reddit_activity (
+            id TEXT PRIMARY KEY,
+            author TEXT,
+            post_link TEXT,
+            comment_link TEXT,
+            parent_post_id TEXT,
+            created_date TEXT,
+            moon_week TEXT,
+            score INTEGER,
+            adjusted_score INTEGER,
+            post_flair_type TEXT,
+            subreddit TEXT,
+            post_type TEXT,
+            title_comment TEXT,
+            content_type TEXT,
+            mod_distinguished INTEGER,
+            rewards_exempt INTEGER
+        )
+    """)
+
+    # Convert rows to dicts
+    rows = db_df.to_dict("records")
+
+    # Insert or update each row
+    cur.executemany("""
+        INSERT INTO reddit_activity (
+            id, author, post_link, comment_link, parent_post_id,
+            created_date, moon_week, score, adjusted_score,
+            post_flair_type, subreddit, post_type, title_comment,
+            content_type, mod_distinguished, rewards_exempt
+        ) VALUES (
+            :id, :author, :post_link, :comment_link, :parent_post_id,
+            :created_date, :moon_week, :score, :adjusted_score,
+            :post_flair_type, :subreddit, :post_type, :title_comment,
+            :content_type, :mod_distinguished, :rewards_exempt
+        )
+        ON CONFLICT(id) DO UPDATE SET
+            score = excluded.score,
+            adjusted_score = excluded.adjusted_score,
+            created_date = excluded.created_date,
+            moon_week = excluded.moon_week
+    """, rows)
+
+    conn.commit()
+    conn.close()
+
+
+# ==========================
+# CONNECT TO REDDIT
+# ==========================
+
+reddit = praw.Reddit(
+    client_id=CLIENT_ID,
+    client_secret=CLIENT_SECRET,
+    user_agent=USER_AGENT,
+    # If you prefer script auth, you can add:
+    # username="YOUR_REDDIT_USERNAME",
+    # password="YOUR_REDDIT_PASSWORD",
+)
+
+subreddit = reddit.subreddit(SUBREDDIT_NAME)
+
+# ==========================
+# TIME WINDOW
+# ==========================
+
+if USE_FIXED_DATES:
+    # inclusive start, inclusive end
+    start_time = datetime.strptime(START_DATE_STR, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    # add 1 day so our upper bound can use "< end_time"
+    end_time = datetime.strptime(END_DATE_STR, "%Y-%m-%d").replace(tzinfo=timezone.utc) + timedelta(days=1)
+    range_label = f"{START_DATE_STR}_to_{END_DATE_STR}"
+else:
+    end_time = datetime.now(timezone.utc)
+    start_time = end_time - timedelta(days=DAYS_BACK)
+    range_label = f"last{DAYS_BACK}d"
+
+print(f"Collecting from r/{SUBREDDIT_NAME} between {start_time} and {end_time} (UTC)\n")
+
+# ==========================
+# STEP 1: COLLECT POSTS
+# ==========================
+
+posts = []
+post_map = {}  # post_id -> (permalink, flair, title)
+
+post_count = 0
+for submission in subreddit.new(limit=MAX_POSTS):
+    created = datetime.fromtimestamp(submission.created_utc, tz=timezone.utc)
+
+    # Skip posts outside our window
+    if created >= end_time:
+        # too new (after our range)
+        continue
+    if created < start_time:
+        # we're now older than the range; list is newest→oldest so we can stop
+        break
+
+    author = str(submission.author) if submission.author else "[deleted]"
+    permalink = f"https://reddit.com{submission.permalink}"
+    flair = submission.link_flair_text or ""
+    content_type = classify_post_content_type(submission)
+
+    rewards_exempt = is_rewards_exempt(author)
+    adjusted_score = compute_adjusted_score(submission.score, flair, rewards_exempt)
+
+    row = {
+        "author": author,
+        "post_link": permalink,
+        "comment_link": "",
+        "id": submission.id,
+        "parent_post_id": submission.id,
+        "created_date": created.date().isoformat(),
+        "score": submission.score,
+        "post_flair_type": flair,
+        "subreddit": SUBREDDIT_NAME,
+        "post_type": "post",           # post or comment
+        "title_comment": submission.title,
+        "content_type": content_type,  # text / image / link / other
+        "mod_distinguished": bool(submission.distinguished),
+        "Rewards Exempt": rewards_exempt,
+        "Adjusted Score": adjusted_score,
+    }
+    posts.append(row)
+
+    post_map[submission.id] = {
+        "permalink": permalink,
+        "flair": flair,
+        "title": submission.title,
+    }
+
+    post_count += 1
+
+print(f"Collected {post_count} posts.\n")
+
+# ==========================
+# STEP 2: COLLECT COMMENTS
+# ==========================
+
+comments = []
+comment_count = 0
+
+for idx, (post_id, post_info) in enumerate(post_map.items(), start=1):
+    print(f"[{idx}/{post_count}] Fetching comments for post {post_id}...")
+    submission = reddit.submission(id=post_id)
+    submission.comments.replace_more(limit=0)
+
+    post_permalink = post_info["permalink"]
+    flair = post_info["flair"]
+
+    for comment in submission.comments.list():
+        created = datetime.fromtimestamp(comment.created_utc, tz=timezone.utc)
+
+        # filter by same window
+        if created < start_time or created >= end_time:
+            continue
+
+        author = str(comment.author) if comment.author else "[deleted]"
+        comment_permalink = f"https://reddit.com{comment.permalink}"
+
+        rewards_exempt = is_rewards_exempt(author)
+        adjusted_score = compute_adjusted_score(comment.score, flair, rewards_exempt)
+
+        row = {
+            "author": author,
+            "post_link": post_permalink,
+            "comment_link": comment_permalink,
+            "id": comment.id,
+            "parent_post_id": post_id,
+            "created_date": created.date().isoformat(),
+            "score": comment.score,
+            "post_flair_type": flair,
+            "subreddit": SUBREDDIT_NAME,
+            "post_type": "comment",
+            "title_comment": comment.body,
+            "content_type": "text",
+            "mod_distinguished": bool(comment.distinguished),
+            "Rewards Exempt": rewards_exempt,
+            "Adjusted Score": adjusted_score,
+        }
+        comments.append(row)
+        comment_count += 1
+
+print(f"\nCollected {comment_count} comments.\n")
+
+# ==========================
+# STEP 3: BUILD SNAPSHOT DATAFRAME
+# ==========================
+
+all_rows = posts + comments
+snapshot_df = pd.DataFrame(all_rows)
+snapshot_df["author"] = snapshot_df["author"].fillna("[deleted]")
+
+# Assign Moon Week
+snapshot_df["moon_week"] = snapshot_df["created_date"].apply(get_moon_week)
+
+# ==========================
+# STEP 4: USER SUMMARY (from Adjusted Score)
+# ==========================
+
+posts_df = snapshot_df[snapshot_df["post_type"] == "post"]
+comments_df = snapshot_df[snapshot_df["post_type"] == "comment"]
+
+# Sum adjusted scores for posts
+if not posts_df.empty:
+    post_scores = (
+        posts_df.groupby("author")["Adjusted Score"]
+        .sum()
+        .rename("post_score")
+    )
+else:
+    post_scores = pd.Series(dtype="int64", name="post_score")
+
+# Sum adjusted scores for comments
+if not comments_df.empty:
+    comment_scores = (
+        comments_df.groupby("author")["Adjusted Score"]
+        .sum()
+        .rename("comment_score")
+    )
+else:
+    comment_scores = pd.Series(dtype="int64", name="comment_score")
+
+# Combine
+user_summary = pd.concat([post_scores, comment_scores], axis=1).fillna(0)
+user_summary["Total Score"] = user_summary["post_score"] + user_summary["comment_score"]
+
+# Turn the index into a column and call it 'Username'
+user_summary = user_summary.reset_index()
+
+# Depending on pandas, the column is usually 'author'
+if "author" in user_summary.columns:
+    user_summary = user_summary.rename(columns={"author": "Username"})
+elif "index" in user_summary.columns:
+    user_summary = user_summary.rename(columns={"index": "Username"})
+else:
+    # fallback: create Username from the index
+    user_summary["Username"] = user_summary.index.astype(str)
+
+# Make sure the score columns exist
+for col in ["comment_score", "post_score"]:
+    if col not in user_summary.columns:
+        user_summary[col] = 0
+
+# Reorder columns
+user_summary = user_summary[["Username", "comment_score", "post_score", "Total Score"]]
+
+# Cast to int
+for col in ["comment_score", "post_score", "Total Score"]:
+    user_summary[col] = user_summary[col].astype(int)
+
+# Sort by total
+user_summary = user_summary.sort_values("Total Score", ascending=False)
+
+# ==========================
+# STEP 5: SAVE TO DB + CSV
+# ==========================
+
+# 5a. Save to SQLite database (persistent, no manual uploads)
+save_snapshot_to_db(snapshot_df)
+
+# 5b. Also save CSVs if you want to open them in Google Sheets
+stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
+
+snapshot_filename = f"rcc_snapshot_data_{range_label}_{stamp}.csv"
+summary_filename = f"rcc_user_summary_{range_label}_{stamp}.csv"
+
+snapshot_df.to_csv(snapshot_filename, index=False)
+user_summary.to_csv(summary_filename, index=False)
+
+print(f"Saved snapshot data to: {snapshot_filename}")
+print(f"Saved user summary to:  {summary_filename}")
+print(f"Saved/updated rows in SQLite database: {DB_PATH}")
+print("\nDone. You can run this daily and everything will accumulate in the DB.")
